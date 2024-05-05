@@ -1,0 +1,4 @@
+"","Accuracy","Kappa","Precision","Recall","F1","Specificity"
+"Decision Tree Model 1",0.839,0.639,0.84,0.691,0.758,0.925
+"Decision Tree Model 2",0.837,0.654,0.754,0.821,0.786,0.846
+"Random Forest Model",0.888,0.759,0.848,0.846,0.847,0.913
