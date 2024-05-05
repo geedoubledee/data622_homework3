@@ -1,0 +1,244 @@
+---
+title: "DATA 622 - Homework 3"
+author: "Glen Dale Davis"
+date: "2024-04-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Packages
+
+```{r packages, warning = FALSE, message = FALSE}
+library(caret)
+library(e1071)
+library(knitr)
+library(png)
+library(RColorBrewer)
+library(tidyverse)
+
+```
+
+## Introduction
+
+We load [the dataset of Web sites](https://www.kaggle.com/datasets/danielfernandon/web-page-phishing-dataset) labeled either `Phishing` or `Legitimate` that we used in Homework 2. As a reminder, below are the first 10 observations in the dataset, and for the sake of readability, only the first 12 columns are displayed.
+
+```{r data}
+cur_theme <- theme_set(theme_classic())
+pal <- brewer.pal(n = 12, name = "Paired")
+my_url <- "https://raw.githubusercontent.com/geedoubledee/data622_homework3/main/web-page-phishing.csv"
+phishing_df <- read.csv(my_url, skip = 1)
+rem <- c("phishing", "n_hastag", "n_hypens")
+phishing_df <- phishing_df |>
+    mutate(LABEL = factor(phishing, labels = c("Legitimate", "Phishing")),
+           n_hashtag = n_hastag,
+           n_hyphens = n_hypens) |>
+    relocate(LABEL, .before = url_length) |>
+    relocate(n_hashtag, .before = n_dollar) |>
+    select(-all_of(rem))
+kable(phishing_df[1:10, 1:12], format = "simple")
+
+```
+
+The first column is the response variable that we will again attempt to predict: a binary factor named `LABEL`. In addition to the response variable, there are 19 integer predictor variables:
+
+```{r variable_classes}
+classes <- as.data.frame(unlist(lapply(phishing_df, class))) |>
+    rownames_to_column()
+cols <- c("Variable", "Class")
+colnames(classes) <- cols
+classes_summary <- classes |>
+    group_by(Class) |>
+    summarize(Count = n(),
+              Variables = paste(sort(unique(Variable)),collapse=", ")) |>
+    filter(Class == "integer")
+kable(classes_summary, format = "simple")
+
+```
+
+All of these predictor variables except for `url_length` and `n_redirection` represent counts of specific punctuation characters within the Web sites' urls. The former is the count of all characters within the url, and the latter is the count of redirects within the url. 
+
+## Data Preparation
+
+Out of those 19 predictors, 14 of them demonstrate near-zero variance:
+
+```{r near-zero_variance}
+nzv <- nearZeroVar(phishing_df, names = TRUE, saveMetrics = FALSE)
+nzv
+
+```
+
+Since they would only serve as noise in our models, we remove them.
+
+```{r n_misc}
+phishing_df <- phishing_df |>
+    select(-all_of(nzv))
+
+```
+
+We then split the data into train and test sets. Because the Support Vector Machine (SVM) models we will be building can be slow to train on large datasets, and we have a large number of observations, we reduce the percentage of data used to train the model from the typical 70% to a more manageable 10%. This reduction seemed a little extreme at first, but we made several attempts to use larger percentages of the data to train the models, and the computation costs only became reasonable at this figure. We appreciate the gain in speed when building the SVM models, and we will see later that they perform very well despite using only a fraction of the data on which the tree models we built in Homework 2 were trained. 
+
+```{r train_test_split}
+set.seed(816)
+sample <- sample(nrow(phishing_df),
+                 round(nrow(phishing_df) * 0.1),
+                 replace = FALSE)
+train_df <- phishing_df[sample, ]
+test_df <- phishing_df[-sample, ]
+
+```
+
+## Model Building
+
+We build both a radial basis and a linear SVM model, using only three-fold cross-validation to further reduce our computation costs.
+
+### SVM Model 1: Radial Basis
+
+A summary of the best radial basis SVM model we arrived at during tuning is below:
+
+```{r svm1}
+fn <- "svm1.rds"
+if (!file.exists(fn)){
+    ctrl <-  tune.control(sampling = "cross", cross = 3, nrepeat = 1)
+    tune_grid <- list(cost = c(0.1, 1, 10, 100, 1000),
+                  gamma = c(0.5, 1, 2, 3, 4))
+    svm_tune1 <- tune(svm, LABEL ~ ., data = train_df, kernel = "radial",
+                 ranges = tune_grid, tunecontrol = ctrl)
+    saveRDS(svm_tune1$best.model, "svm1.rds")
+}else{
+    svm1 <- readRDS("svm1.rds")
+}
+summarize_svm <- function(svm_model){
+    col1 <- c("call", "cost", "gamma", "num_classes", "classes",
+              "support_vectors_total", "support_vectors_split")
+    subset <- c("call", "cost", "gamma", "nclasses", "levels",
+              "tot.nSV", "nSV")
+    col2 <- svm_model[subset]
+    copy <- col2
+    for (i in 1:length(copy)){
+        if (is.vector(copy[[i]])){
+            col2[[i]] <- paste(col2[[i]], collapse = ", ")
+        }
+    }
+    summ <- as.data.frame(cbind(col1, col2))
+    rownames(summ) <- NULL
+    colnames(summ) <- c("Parameter", "Value")
+    summ
+}
+summ <- summarize_svm(svm1)
+kable(summ, format = "simple")
+
+```
+
+It uses a cost of 1 and a gamma of 4. 
+
+### SVM Model 2: Linear
+
+A summary of the best linear SVM model we arrived at during tuning is below:
+
+```{r svm2, warning = FALSE, message = FALSE}
+fn <- "svm2.rds"
+if (!file.exists(fn)){
+    ctrl <-  tune.control(sampling = "cross", cross = 3, nrepeat = 1)
+    tune_grid <- list(cost = c(0.1, 1, 10, 100, 1000))
+    svm_tune2 <- tune(svm, LABEL ~ ., data = train_df, kernel = "linear",
+                      ranges = tune_grid, tunecontrol = ctrl)
+    saveRDS(svm_tune2$best.model, "svm2.rds")
+}else{
+    svm2 <- readRDS("svm2.rds")
+}
+summ <- summarize_svm(svm2)
+kable(summ, format = "simple")
+
+```
+
+It uses a cost of 0.1. (Gamma was held constant at 0.2 during cross-validation.)
+
+## Model Evaluation
+
+We make predictions on the test data using both models, and we construct confusion matrices for them.
+
+```{r }
+pred_svm1 <- predict(svm1, test_df, type = "class")
+svm1cm_complete <- confusionMatrix(pred_svm1, test_df$LABEL,
+                                    positive = "Phishing")
+svm1cm <- as.data.frame(svm1cm_complete$table)
+svm1cm$Reference <- factor(svm1cm$Reference,
+                           levels = rev(levels(svm1cm$Reference)))
+svm1cm <- svm1cm |>
+    mutate(
+        Label = case_when(
+            Prediction == "Legitimate" & Reference == "Legitimate" ~ "TN",
+            Prediction == "Phishing" & Reference == "Phishing" ~ "TP",
+            Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
+            Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
+        Model = "SVM Model 1: Radial Basis")
+pred_svm2 <- predict(svm2, test_df, type = "class")
+svm2cm_complete <- confusionMatrix(pred_svm2, test_df$LABEL,
+                                    positive = "Phishing")
+svm2cm <- as.data.frame(svm2cm_complete$table)
+svm2cm$Reference <- factor(svm2cm$Reference,
+                           levels = rev(levels(svm2cm$Reference)))
+svm2cm <- svm2cm |>
+    mutate(
+        Label = case_when(
+            Prediction == "Legitimate" & Reference == "Legitimate" ~ "TN",
+            Prediction == "Phishing" & Reference == "Phishing" ~ "TP",
+            Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
+            Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
+        Model = "SVM Model 2: Linear")
+cm <- bind_rows(svm1cm, svm2cm)
+p1 <- cm |>
+    ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
+    geom_tile(col = "black") +
+    geom_text(aes(label = Freq)) +
+    geom_text(aes(label = Label), vjust = 3) + 
+    scale_fill_gradient(low = "white", high = pal[8]) +
+    scale_x_discrete(position = "top") +
+    facet_wrap(Model ~ ., ncol = 3, strip.position = "bottom") +
+    labs(title = "Confusion Matrices for Both SVM Models") +
+    theme(axis.line.x = element_blank(),
+          axis.line.y = element_blank(),
+          axis.text.y = element_text(angle = 90, hjust = 0.5),
+          axis.ticks = element_blank(),
+          legend.position = "right",
+          strip.placement = "outside")
+p1
+
+```
+
+We can see that the radial basis SVM model has a pretty even mix of False Positives and False Negatives, whereas the linear SVM model suffers much more from False Negatives than False Positives. The linear SVM model also has fewer False Positives than the radial basis SVM model, but still results in more total classification errors because of its large number of False Negatives.
+
+For the sake of comparison, we also load the confusion matrices for the tree models we built in Homework 2.
+
+```{r }
+p2 <- readRDS("data622_hw2_p4.rds")
+p2
+
+```
+
+Recall that the SVM models were tested on a larger number of observations than the tree models because the tree models utilized more of the total observations as training data, so direct comparisons of the raw numbers would be erroneous. However, we can state generally that the Random Forest model and the radial basis SVM model achieved similar levels of balance between False Positives and False Negatives, whereas the linear SVM model and the Decision Tree models all resulted in much more of one kind of error than the other. 
+
+We calculate the performance metrics for both SVM models, and we load the performance metrics for the tree models we built in Homework 2.
+
+```{r }
+metrics <- as.data.frame(cbind(rbind(svm1cm_complete$byClass,
+                                     svm2cm_complete$byClass),
+                               rbind(svm1cm_complete$overall,
+                                     svm2cm_complete$overall)))
+rownames(metrics) <- c("SVM Model 1: Radial Basis",
+                       "SVM Model 2: Linear")
+keep <- c("Accuracy", "Kappa", "Precision", "Recall", "F1", "Specificity")
+metrics <- metrics |>
+    select(all_of(keep)) |>
+    round(3)
+kable(metrics, format = "simple")
+
+```
+
+The radial basis SVM model is more accurate than the linear SVM model, and it has a better balance between precision and recall, as we were able to detect visually. 
+
+## Conclusion
+
