@@ -13,9 +13,14 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ```{r packages, warning = FALSE, message = FALSE}
 library(caret)
+library(DataExplorer)
 library(e1071)
+library(ggcorrplot)
 library(knitr)
+library(MASS)
+select <- dplyr::select
 library(png)
+library(psych)
 library(RColorBrewer)
 library(tidyverse)
 
@@ -60,9 +65,64 @@ kable(classes_summary, format = "simple")
 
 All of these predictor variables except for `url_length` and `n_redirection` represent counts of specific punctuation characters within the Web sites' urls. The former is the count of all characters within the url, and the latter is the count of redirects within the url. 
 
-## Data Preparation
+The exploratory data analysis that follows is largely the same as was performed during Homework 2. 
 
-Out of those 19 predictors, 14 of them demonstrate near-zero variance:
+## Exploratory Data Analysis
+
+We check for any missing values within the dataset. 
+
+```{r completeness}
+rem <- c("discrete_columns", "continuous_columns",
+            "total_observations", "memory_usage")
+completeness <- introduce(phishing_df) |>
+    select(-all_of(rem))
+knitr::kable(t(completeness), format = "simple")
+
+```
+
+Of the 100,000+ observations, none contain missing values we need to address for any of the variables.
+
+We check the distribution of the response variable to see if there's a class imbalance between `Phishing` Web sites and `Legitimate` Web sites.
+
+```{r response_dist, warning = FALSE, message = FALSE}
+pal <- brewer.pal(n = 12, name = "Paired")
+cols <- pal[c(2, 8)]
+names(cols) <- c("Legitimate", "Phishing")
+obs = nrow(phishing_df)
+p1 <- phishing_df |>
+    ggplot(aes(x = LABEL)) +
+    geom_histogram(aes(color = LABEL, fill = LABEL), stat = "count") +
+    geom_text(stat = "count", aes(label = paste0(round(
+        after_stat(count) / obs * 100, 1), "%")),
+              size = 5, color = "white", vjust = 2, fontface = "bold") + 
+    scale_color_manual(values = cols) +
+    scale_fill_manual(values = cols) +
+    scale_y_continuous(labels = scales::comma) +
+    labs(title = "Distribution of Phishing & Legitimate Web sites",
+         y = "COUNT") +
+    theme(legend.position = "none")
+p1
+
+```
+
+The ratio of `Legitimate` to `Phishing` Web sites is not quite 2:1, so the classes are only marginally imbalanced here, and no oversampling corrections will be required later.
+
+We summarize the distributions of the predictor variables. 
+
+```{r describe}
+rem <- c("vars", "n", "trimmed", "mad", "skew", "kurtosis", "se")
+excl <- c("LABEL*")
+describe <- describe(phishing_df) |>
+    select(-all_of(rem))
+describe <- describe |>
+    filter(!rownames(describe) %in% excl)
+knitr::kable(describe, format = "simple")
+
+```
+
+The median for many of these predictor variables is 0, which suggests their distributions are degenerate. One predictor, `n_redirection`,  also seems to have a nonsensical range that includes -1, but we leave these values as-is since the Support Vector Machine (SVM) models we will be building can't handle missing values unless they've been imputed, and we favor the original values over imputation here. 
+
+Out of these predictors, 14 of them demonstrate near-zero variance:
 
 ```{r near-zero_variance}
 nzv <- nearZeroVar(phishing_df, names = TRUE, saveMetrics = FALSE)
@@ -78,7 +138,69 @@ phishing_df <- phishing_df |>
 
 ```
 
-We then split the data into train and test sets. Because the Support Vector Machine (SVM) models we will be building can be slow to train on large datasets, and we have a large number of observations, we reduce the percentage of data used to train the model from the typical 70% to a more manageable 10%. This reduction seemed a little extreme at first, but we made several attempts to use larger percentages of the data to train the models, and the computation costs only became reasonable at this figure. We appreciate the gain in speed when building the SVM models, and we will see later that they perform very well despite using only a fraction of the data on which the tree models we built in Homework 2 were trained. 
+We take a look at the distributions of the remaining predictor variables.
+
+```{r predictors_dist, warning = FALSE, message = FALSE}
+skip <- c("LABEL")
+phishing_piv <- phishing_df |>
+    pivot_longer(cols = !all_of(skip), names_to = "PREDICTOR",
+                 values_to = "VALUE")
+p2 <- phishing_piv |>
+    ggplot(aes(x = VALUE, color = LABEL, fill = LABEL)) +
+    geom_histogram(data = subset(phishing_piv, LABEL == "Legitimate"),
+                   alpha = 0.5) +
+    geom_histogram(data = subset(phishing_piv, LABEL == "Phishing"),
+                   alpha = 0.5) +
+    scale_color_manual(values = cols) +
+    scale_fill_manual(values = cols) +
+    scale_y_continuous(labels = scales::comma) +
+    facet_wrap(PREDICTOR ~ ., ncol = 2, scales = "free_x") +
+    labs(title = "Distribution of Remaining Predictor Variables",
+         y = "COUNT") +
+    theme(legend.position = "top")
+p2
+
+```
+
+The distributions for the remaining predictor variables are all right-skewed. We forego any transformations since they weren't appropriate during Homework 2, and we'll be making comparisons later between the SVM models we will be building and the tree models we developed then.
+
+We visualize correlations between the response variable and the remaining predictors, as well as any predictor-predictor correlations. In the interest of ignoring clutter, only correlations greater than 0.1 (in absolute value) are displayed.
+
+```{r correlations}
+plot_corr_range <- function(df, mn=0.1, mx=1.0, excl=c(NA)){
+    palette <- brewer.pal(n = 7, name = "RdBu")[c(1, 4, 7)]
+    tit = sprintf("Correlations Between %s and %s (Absolute Value)", mn, mx)
+    r <- model.matrix(~0+., data = df) |>
+        cor() |>
+        round(digits=2)
+    is.na(r) <- abs(r) > mx
+    is.na(r) <- abs(r) < mn
+    if (!is.na(excl)){
+        r <- as.data.frame(r) |>
+            select(-all_of(excl)) |>
+            filter(!rownames(r) %in% excl)
+    }
+    p <- r |>
+        ggcorrplot(show.diag = FALSE, type = "lower", lab = TRUE,
+                   lab_size = 3, tl.cex = 10, tl.srt = 90,
+                   colors = palette, outline.color = "white") +
+        labs(title = tit) +
+        theme(plot.title.position = "plot")
+    p
+}
+excl <- c("LABELLegitimate")
+p3 <- plot_corr_range(df = phishing_df, excl = excl)
+p3
+
+```
+
+We see that `n_slash` is strongly positively correlated with `Phishing` Web sites, and `url_length` is moderately positively correlated with `Phishing` Web sites. So the more slashes a url contains, and the longer the url is, the more likely it is that the url belongs to a `Phishing` Web site. No other predictor variables have as strong of a correlation with the response variable as either of these.
+
+We also see that `url_length` is pretty correlated with most other predictors, including `n_slash`. We generated a set of models that excluded either `url_length` or `n_slash` to compare performance, but they performed worse than models that included both predictors, so we ultimately decided not to exclude either.
+
+## Data Preparation
+
+We then split the data into train and test sets. Because the SVM models we will be building can be slow to train on large datasets, and we have a large number of observations, we reduce the percentage of data used to train the model from the typical 70% to a more manageable 10%. This reduction seemed a little extreme at first, but we made several attempts to use larger percentages of the data to train the models, and the computation costs only became reasonable at this figure. We appreciate the gain in speed when building the SVM models, and we will see later that they perform very well despite using only a fraction of the data on which the tree models we built in Homework 2 were trained. 
 
 ```{r train_test_split}
 set.seed(816)
@@ -92,11 +214,11 @@ test_df <- phishing_df[-sample, ]
 
 ## Model Building
 
-We build both a radial basis and a linear SVM model, using only three-fold cross-validation to further reduce our computation costs.
+We build both radial basis and linear SVM models, using only three-fold cross-validation to further reduce our computation costs. 
 
 ### SVM Model 1: Radial Basis
 
-A summary of the best radial basis SVM model we arrived at during tuning is below:
+A summary of the best radial basis SVM model that we arrived at during tuning is below:
 
 ```{r svm1}
 fn <- "svm1.rds"
@@ -104,9 +226,11 @@ if (!file.exists(fn)){
     ctrl <-  tune.control(sampling = "cross", cross = 3, nrepeat = 1)
     tune_grid <- list(cost = c(0.1, 1, 10, 100, 1000),
                   gamma = c(0.5, 1, 2, 3, 4))
-    svm_tune1 <- tune(svm, LABEL ~ ., data = train_df, kernel = "radial",
-                 ranges = tune_grid, tunecontrol = ctrl)
-    saveRDS(svm_tune1$best.model, "svm1.rds")
+    svm_tune1 <- tune(svm, LABEL ~ .,
+                      data = train_df, kernel = "radial",
+                      ranges = tune_grid, tunecontrol = ctrl)
+    svm1 <- svm_tune1$best.model
+    saveRDS(svm1, "svm1.rds")
 }else{
     svm1 <- readRDS("svm1.rds")
 }
@@ -136,16 +260,18 @@ It uses a cost of 1 and a gamma of 4.
 
 ### SVM Model 2: Linear
 
-A summary of the best linear SVM model we arrived at during tuning is below:
+A summary of the best linear SVM model that we arrived at during tuning is below:
 
 ```{r svm2, warning = FALSE, message = FALSE}
 fn <- "svm2.rds"
 if (!file.exists(fn)){
     ctrl <-  tune.control(sampling = "cross", cross = 3, nrepeat = 1)
     tune_grid <- list(cost = c(0.1, 1, 10, 100, 1000))
-    svm_tune2 <- tune(svm, LABEL ~ ., data = train_df, kernel = "linear",
-                      ranges = tune_grid, tunecontrol = ctrl)
-    saveRDS(svm_tune2$best.model, "svm2.rds")
+    svm_tune2 <- tune(svm, LABEL ~ .,
+                       data = train_df, kernel = "linear",
+                       ranges = tune_grid, tunecontrol = ctrl)
+    svm2 <- svm_tune2$best.model
+    saveRDS(svm2, "svm2.rds")
 }else{
     svm2 <- readRDS("svm2.rds")
 }
@@ -189,23 +315,24 @@ svm2cm <- svm2cm |>
             Prediction == "Legitimate" & Reference == "Phishing" ~ "FN",
             Prediction == "Phishing" & Reference == "Legitimate" ~ "FP"),
         Model = "SVM Model 2: Linear")
+
 cm <- bind_rows(svm1cm, svm2cm)
-p1 <- cm |>
+p4 <- cm |>
     ggplot(aes(x = Reference, y = Prediction, fill = Freq)) +
     geom_tile(col = "black") +
     geom_text(aes(label = Freq)) +
     geom_text(aes(label = Label), vjust = 3) + 
     scale_fill_gradient(low = "white", high = pal[8]) +
     scale_x_discrete(position = "top") +
-    facet_wrap(Model ~ ., ncol = 3, strip.position = "bottom") +
-    labs(title = "Confusion Matrices for Both SVM Models") +
+    facet_wrap(Model ~ ., ncol = 2, strip.position = "bottom") +
+    labs(title = "Confusion Matrices for SVM Models") +
     theme(axis.line.x = element_blank(),
           axis.line.y = element_blank(),
           axis.text.y = element_text(angle = 90, hjust = 0.5),
           axis.ticks = element_blank(),
           legend.position = "right",
           strip.placement = "outside")
-p1
+p4
 
 ```
 
@@ -214,14 +341,14 @@ We can see that the radial basis SVM model has a pretty even mix of False Positi
 For the sake of comparison, we also load the confusion matrices for the tree models we built in Homework 2.
 
 ```{r }
-p2 <- readRDS("data622_hw2_p4.rds")
-p2
+p5 <- readRDS("data622_hw2_p4.rds")
+p5
 
 ```
 
 Recall that the SVM models were tested on a larger number of observations than the tree models because the tree models utilized more of the total observations as training data, so direct comparisons of the raw numbers would be erroneous. However, we can state generally that the Random Forest model and the radial basis SVM model achieved similar levels of balance between False Positives and False Negatives, whereas the linear SVM model and the Decision Tree models all resulted in much more of one kind of error than the other. 
 
-We calculate the performance metrics for both SVM models, and we load the performance metrics for the tree models we built in Homework 2.
+We calculate the performance metrics for both SVM models, and we load the performance metrics for the tree models we built in Homework 2 for comparison.
 
 ```{r }
 metrics <- as.data.frame(cbind(rbind(svm1cm_complete$byClass,
@@ -230,15 +357,22 @@ metrics <- as.data.frame(cbind(rbind(svm1cm_complete$byClass,
                                      svm2cm_complete$overall)))
 rownames(metrics) <- c("SVM Model 1: Radial Basis",
                        "SVM Model 2: Linear")
+my_url2 <- "https://raw.githubusercontent.com/geedoubledee/data622_homework3/main/data622_hw2_metrics.csv"
+metrics_prev <- read.csv(my_url2, row.names = 1)
 keep <- c("Accuracy", "Kappa", "Precision", "Recall", "F1", "Specificity")
 metrics <- metrics |>
     select(all_of(keep)) |>
-    round(3)
+    round(3) |>
+    bind_rows(metrics_prev)
 kable(metrics, format = "simple")
+
 
 ```
 
-The radial basis SVM model is more accurate than the linear SVM model, and it has a better balance between precision and recall, as we were able to detect visually. 
+The radial basis SVM model is more accurate than the linear SVM model, and it has a better balance between precision and recall, as we were able to detect visually. Both SVM models were more accurate than the two Decision Tree models, but neither was as accurate as the Random Forest model. The Random Forest model also has the best balance between precision and recall overall, as well as the best recall period, but it is worth noting that the linear SVM model beats it in precision.
 
 ## Conclusion
 
+Although the Random Forest model is still the best performer, the radial basis SVM model is not that far behind it. It also required a lot less training data to achieve these decent results than the Random Forest model used. It generalized very well to the test data, which is a trademark ability of SVM models that are able to find large margins. They can ignore noise, and they don't suffer from overfitting, so they lead to relatively small amounts of classification error.
+
+Had the SVM models been able to utilize more data during training, there's a decent chance they could have outperformed the Random Forest model. We have worked with SVM models before, and training them using the `tune` function from the `e1071` library seemed slower than our previous attempts using the `train` function from the `caret` library. When we have more time, we will consider an experiment that compares the computation times. If utilizing different libraries doesn't make a difference, we would like to find out what does because even though we know SVM models can become slow to train with large datasets, we didn't think our dataset was really that large in the grand scheme of things. 
